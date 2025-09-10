@@ -114,9 +114,11 @@ async def on_member_join(member):
     welcome_channel = discord.utils.get(member.guild.text_channels, name="bienvenida")
     if welcome_channel:
         await welcome_channel.send(
-            f"👋 ¡Bienvenido {member.mention} a la Academia! 🏋️\n"
-            "Lee las `#reglas`, preséntate en `#presentaciones` y comparte tus avances en `#progresos`.\n"
-            "¡A entrenar con todo! 💪🔥"
+            f"👋 Bienvenido {member.mention} a la Academia de Calistenia 🏋️ \n"
+            "Aquí entrenamos juntos, compartimos progresos y nos respetamos siempre 💪🔥 \n"
+            "📌 No olvides leer `#reglas` \n"
+            "📸 Comparte tus avances en `#progresos` y motiva a la comunidad \n"
+            "¡Prepárate para crecer con nosotros! \n"
         )
 
 @bot.event
