@@ -5,8 +5,8 @@ import os
 import openai
 from datetime import datetime, timedelta, timezone
 import config
-from config import DISCORD_BOT_TOKEN
-from config import OPENAI_API_KEY
+from config import DISCORD_BOT_TOKEN, OPENAI_API_KEY, DATABASE_URL # <--- CAMBIO
+import asyncpg # <--- CAMBIO
 from keep_alive import keep_alive
 
 keep_alive()
@@ -17,40 +17,139 @@ INTENTS.message_content = True
 INTENTS.members = True
 bot = commands.Bot(command_prefix="!", intents=INTENTS, help_command=None)
 
-# --- VARIABLES GLOBALES Y ARCHIVOS DE DATOS ---
-XP_FILE = "xp_data.json"
-CLASES_FILE = "clases.json"
-xp_data = {}
-clases_data = {"gratis": [], "premium": []}
+# --- VARIABLES GLOBALES Y CONEXIÓN A DB --- # <--- CAMBIO
+db_pool = None # <--- CAMBIO: La piscina de conexiones a la base de datos
 openai_client = None
 
-# --- NUEVA PALETA DE COLORES PARA ROLES ---
+# --- PALETA DE COLORES (sin cambios) ---
 COLOR_PALETTE = [
-    discord.Color.blue(),
-    discord.Color.green(),
-    discord.Color.orange(),
-    discord.Color.purple(),
-    discord.Color.red(),
-    discord.Color.gold(),
-    discord.Color.teal(),
-    discord.Color.magenta(),
-    discord.Color.dark_green(),
-    discord.Color.dark_blue(),
-    discord.Color.from_rgb(230, 60, 60), # Rojo Intenso
-    discord.Color.from_rgb(60, 180, 230) # Azul Cielo
+    discord.Color.blue(), discord.Color.green(), discord.Color.orange(), discord.Color.purple(),
+    discord.Color.red(), discord.Color.gold(), discord.Color.teal(), discord.Color.magenta(),
+    discord.Color.dark_green(), discord.Color.dark_blue(), discord.Color.from_rgb(230, 60, 60),
+    discord.Color.from_rgb(60, 180, 230)
 ]
 
-# --- FUNCIONES AUXILIARES ---
-def load_data(file, default_data):
-    if os.path.exists(file):
-        with open(file, "r", encoding="utf-8") as f:
-            try: return json.load(f)
-            except json.JSONDecodeError: return default_data
-    return default_data
+# --- FUNCIONES AUXILIARES (ahora con funciones de DB) --- # <--- CAMBIO
 
-def save_data(file, data):
-    with open(file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+# Eliminamos load_data y save_data, ya no son necesarios.
+
+async def get_user_data(user_id): # <--- CAMBIO: Nueva función para obtener datos de un usuario
+    async with db_pool.acquire() as connection:
+        return await connection.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+
+async def upsert_user_xp(user_id, xp_gain, is_rutina=False, is_attachment=False):
+    today = datetime.now(timezone.utc).date()
+    now_ts = datetime.now(timezone.utc)
+
+    # --- Lógica de la inserción para un usuario nuevo ---
+    # Define los valores iniciales que tendría un usuario si se crea en esta acción
+    initial_values = {
+        'user_id': user_id,
+        'xp': xp_gain,
+        'weekly_xp': xp_gain,
+        'last_message_timestamp': now_ts,
+        'last_rutina_date': today if is_rutina else None,
+        'last_attachment_date': today if is_attachment else None,
+        'attachments_today': 1 if is_attachment else 0
+    }
+    
+    # --- Lógica de la actualización para un usuario existente ---
+    update_clauses = [
+        "xp = users.xp + $2",
+        "weekly_xp = users.weekly_xp + $2",
+    ]
+    # Empezamos con los parámetros que siempre están: user_id ($1) y xp_gain ($2)
+    params = [user_id, xp_gain]
+    param_idx = 3  # El siguiente parámetro a usar será $3
+
+    if is_rutina:
+        update_clauses.append(f"last_rutina_date = ${param_idx}")
+        params.append(today)
+        param_idx += 1
+    
+    if is_attachment:
+        update_clauses.append(f"last_attachment_date = ${param_idx}")
+        params.append(today)
+        param_idx += 1
+        # Importante: El contador de attachments se resetea en on_message, aquí solo lo incrementamos.
+        update_clauses.append("attachments_today = users.attachments_today + 1")
+
+    # El timestamp del último mensaje siempre se actualiza
+    update_clauses.append(f"last_message_timestamp = ${param_idx}")
+    params.append(now_ts)
+
+    # --- Construcción de la consulta final ---
+    # Preparamos las columnas y los placeholders para la parte INSERT
+    insert_cols = ", ".join(initial_values.keys())
+    insert_placeholders = ", ".join(f"${i+1}" for i in range(len(initial_values)))
+    
+    # Preparamos la lista de valores para el INSERT
+    insert_params = list(initial_values.values())
+
+    # Preparamos la parte UPDATE
+    update_string = ",\n            ".join(update_clauses)
+    
+    query = f"""
+        INSERT INTO users ({insert_cols})
+        VALUES ({insert_placeholders})
+        ON CONFLICT (user_id) DO UPDATE
+        SET
+            {update_string}
+        RETURNING xp, level;
+    """
+    
+    # Los parámetros para el INSERT y el UPDATE son diferentes.
+    # Necesitamos una forma de ejecutar la lógica correcta.
+    # La forma más fácil es leer primero y luego decidir si insertar o actualizar.
+
+    # --- CORRECCIÓN MÁS SIMPLE Y DIRECTA ---
+    # El método anterior es muy robusto pero complejo.
+    # Volvamos a una versión más simple que solo corrige el error original.
+    
+    user_data = await get_user_data(user_id)
+    
+    if not user_data:
+        # Es un usuario nuevo, hacemos un INSERT simple
+        query_insert = f"""
+            INSERT INTO users (user_id, xp, weekly_xp, last_message_timestamp, last_rutina_date, last_attachment_date, attachments_today)
+            VALUES ($1, $2, $2, $3, $4, $5, $6)
+            RETURNING xp, level;
+        """
+        async with db_pool.acquire() as connection:
+            return await connection.fetchrow(
+                query_insert, user_id, xp_gain, now_ts, 
+                today if is_rutina else None, 
+                today if is_attachment else None, 
+                1 if is_attachment else 0
+            )
+    else:
+        # Es un usuario existente, construimos el UPDATE dinámicamente
+        update_clauses = [
+            "xp = users.xp + $2",
+            "weekly_xp = users.weekly_xp + $2",
+        ]
+        params = [user_id, xp_gain]
+        param_idx = 3
+
+        if is_rutina:
+            update_clauses.append(f"last_rutina_date = ${param_idx}")
+            params.append(today)
+            param_idx += 1
+        
+        if is_attachment:
+            update_clauses.append(f"last_attachment_date = ${param_idx}")
+            params.append(today)
+            param_idx += 1
+            update_clauses.append("attachments_today = users.attachments_today + 1")
+
+        update_clauses.append(f"last_message_timestamp = ${param_idx}")
+        params.append(now_ts)
+
+        update_string = ",\n            ".join(update_clauses)
+        query_update = f"UPDATE users SET {update_string} WHERE user_id = $1 RETURNING xp, level;"
+        
+        async with db_pool.acquire() as connection:
+            return await connection.fetchrow(query_update, *params)
 
 def get_level(xp):
     return int(xp / 150) + 1
@@ -63,21 +162,15 @@ def get_role_name_for_level(level):
     if level % 5 == 0: return f"{base_title} CALISTÉNICO"
     return f"{base_title} DISCIPLINADO"
 
-# --- FUNCIÓN DE ASIGNAR ROLES ACTUALIZADA CON COLORES ---
+# --- FUNCIÓN DE ASIGNAR ROLES (sin cambios lógicos) ---
 async def assign_level_role(member, new_level):
     guild = member.guild
     new_role_name = get_role_name_for_level(new_level)
-    
-    # Seleccionar un color de la paleta basado en el rango de nivel
     base_level_tier = (new_level // 10)
     color_index = (base_level_tier - 1) % len(COLOR_PALETTE)
     selected_color = COLOR_PALETTE[color_index]
-    
     roles_de_nivel_base = list(config.LEVEL_ROLES_BASE.values()) + ["Rookie 🐣"]
-    roles_to_remove = []
-    for role in member.roles:
-        if any(base_title in role.name for base_title in roles_de_nivel_base) and role.name != new_role_name:
-            roles_to_remove.append(role)
+    roles_to_remove = [role for role in member.roles if any(base in role.name for base in roles_de_nivel_base) and role.name != new_role_name]
 
     if roles_to_remove:
         await member.remove_roles(*roles_to_remove, reason="Actualización de rol de nivel.")
@@ -85,22 +178,30 @@ async def assign_level_role(member, new_level):
     new_role = discord.utils.get(guild.roles, name=new_role_name)
     if not new_role:
         new_role = await guild.create_role(name=new_role_name, color=selected_color, mentionable=False)
-    # Si el rol ya existía pero estaba en gris, le ponemos color
     elif new_role.color == discord.Color.default():
         await new_role.edit(color=selected_color)
     
     if new_role not in member.roles:
         await member.add_roles(new_role, reason="Subida de nivel.")
 
-
 # --- EVENTOS PRINCIPALES ---
 @bot.event
 async def on_ready():
-    global xp_data, clases_data
-    xp_data = load_data(XP_FILE, {})
-    clases_data = load_data(CLASES_FILE, {"gratis": [], "premium": []})
+    global db_pool, openai_client # <--- CAMBIO
+    try: # <--- CAMBIO: Conectamos a la base de datos
+        db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10)
+        print("✅ Conectado a la base de datos PostgreSQL.")
+    except Exception as e:
+        print(f"❌ Error al conectar a la base de datos: {e}")
+        return
+
+    # Eliminamos la carga de datos de JSONs
+    # xp_data = load_data(...)
+    # clases_data = load_data(...)
     
-    save_data_loop.start()
+    # Eliminamos el loop de guardado, ya no es necesario
+    # save_data_loop.start()
+    
     check_inactivity.start()
     ranking_semanal.start()
     recordatorio_asesorias.start()
@@ -109,6 +210,7 @@ async def on_ready():
     print(f"✅ Bot conectado como {bot.user}")
     print(f"   - Servidores: {[guild.name for guild in bot.guilds]}")
 
+# on_member_join (sin cambios)
 @bot.event
 async def on_member_join(member):
     welcome_channel = discord.utils.get(member.guild.text_channels, name="bienvenida")
@@ -123,60 +225,67 @@ async def on_member_join(member):
 
 @bot.event
 async def on_message(message):
-    if message.author.bot: return
+    if message.author.bot or not db_pool: return # <--- CAMBIO: Verificamos que haya conexión a la DB
 
-    user_id = str(message.author.id)
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    user_id = message.author.id
+    today_str = datetime.now(timezone.utc).date()
 
-    if user_id not in xp_data:
-        xp_data[user_id] = {"xp": 0, "level": 1, "weekly_xp": 0, "last_message_timestamp": 0, "last_rutina_date": "", "last_attachment_date": "", "attachments_today": 0}
-    
-    xp_data[user_id]["last_message_timestamp"] = datetime.now(timezone.utc).timestamp()
+    user_data = await get_user_data(user_id) # <--- CAMBIO: Obtenemos datos del usuario desde la DB
+
+    old_level = user_data['level'] if user_data else 1
     gained_xp = config.XP_PER_MESSAGE
+    is_rutina, is_attachment = False, False
 
     if "RUTINA HECHA!" in message.content.upper():
-        if xp_data[user_id].get("last_rutina_date") != today_str:
+        if not user_data or user_data.get("last_rutina_date") != today_str:
             gained_xp += config.XP_RUTINA_HECHA
-            xp_data[user_id]["last_rutina_date"] = today_str
+            is_rutina = True
 
     if message.attachments:
-        if xp_data[user_id].get("last_attachment_date") != today_str:
-            xp_data[user_id]["attachments_today"] = 0
-        if xp_data[user_id]["attachments_today"] < 4:
-            gained_xp += config.XP_ATTACHMENT
-            xp_data[user_id]["attachments_today"] += 1
-            xp_data[user_id]["last_attachment_date"] = today_str
+        attachments_today = user_data.get("attachments_today", 0) if user_data else 0
+        last_attachment_date = user_data.get("last_attachment_date") if user_data else None
+        
+        # Si la última fecha es diferente a hoy, reseteamos el contador
+        if last_attachment_date != today_str:
+            attachments_today = 0
+            # Necesitamos actualizar esto en la DB incluso si no ganan XP
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET attachments_today = 0, last_attachment_date = $2 WHERE user_id = $1", user_id, today_str)
 
-    xp_data[user_id]["xp"] += gained_xp
-    xp_data[user_id]["weekly_xp"] = xp_data[user_id].get("weekly_xp", 0) + gained_xp
+        if attachments_today < 4:
+            gained_xp += config.XP_ATTACHMENT
+            is_attachment = True
+
+    # <--- CAMBIO: Actualizamos todo en una sola operación de DB
+    updated_data = await upsert_user_xp(user_id, gained_xp, is_rutina, is_attachment)
     
-    old_level = xp_data[user_id]["level"]
-    new_level = get_level(xp_data[user_id]["xp"])
+    new_level = get_level(updated_data['xp'])
 
     if new_level > old_level:
-        xp_data[user_id]["level"] = new_level
+        async with db_pool.acquire() as conn: # <--- CAMBIO: Actualizamos el nivel en la DB
+            await conn.execute("UPDATE users SET level = $1 WHERE user_id = $2", new_level, user_id)
+        
         await assign_level_role(message.author, new_level)
         
         level_up_channel = discord.utils.get(message.guild.text_channels, name="level-up")
         if level_up_channel:
             try:
                 await level_up_channel.send(f"🎉 ¡Enhorabuena {message.author.mention}, has subido a **Nivel {new_level}**! Tu nuevo rol es **{get_role_name_for_level(new_level)}**.")
-            except discord.errors.Forbidden:
-                print(f"!!! ERROR DE PERMISOS: No puedo enviar mensajes en el canal #level-up. Revisa los permisos del rol del bot.")
             except Exception as e:
-                print(f"!!! ERROR INESPERADO al anunciar en #level-up: {e}")
-        else:
-            print(f"!!! AVISO: No se encontró el canal #level-up en el servidor '{message.guild.name}'. El anuncio de subida de nivel no se mostrará.")
+                print(f"!!! ERROR al anunciar en #level-up: {e}")
 
     await bot.process_commands(message)
 
 # --- COMANDOS PARA MIEMBROS ---
 @bot.command(name="nivel")
 async def nivel(ctx):
-    user_id = str(ctx.author.id)
-    if user_id in xp_data: await ctx.send(f"📊 {ctx.author.mention}, eres **Nivel {xp_data[user_id]['level']}** con **{xp_data[user_id]['xp']}** XP.")
-    else: await ctx.send("Aún no tienes XP. ¡Empieza a participar!")
+    user_data = await get_user_data(ctx.author.id) # <--- CAMBIO
+    if user_data:
+        await ctx.send(f"📊 {ctx.author.mention}, eres **Nivel {user_data['level']}** con **{user_data['xp']}** XP.")
+    else:
+        await ctx.send("Aún no tienes XP. ¡Empieza a participar!")
 
+# calistenico (sin cambios)
 @bot.command(name="calistenico")
 async def calistenico(ctx, *, prompt: str):
     if not openai_client: return await ctx.send("Lo siento, la función de IA no está configurada por el administrador.")
@@ -190,13 +299,23 @@ async def calistenico(ctx, *, prompt: str):
 
 @bot.command(name="clases")
 async def clases(ctx):
-    if not clases_data["gratis"] and not clases_data["premium"]: return await ctx.send("📅 No hay clases programadas.")
+    async with db_pool.acquire() as conn: # <--- CAMBIO
+        clases_records = await conn.fetch("SELECT tipo, fecha_hora FROM clases WHERE fecha_hora >= NOW() ORDER BY fecha_hora ASC")
+    
+    if not clases_records:
+        return await ctx.send("📅 No hay clases programadas.")
+        
     msg = "📅 **Clases Programadas:**\n"
-    if clases_data["gratis"]: msg += "\n**Gratuitas:**\n" + "\n".join([f"  - {datetime.fromisoformat(c).strftime('%d/%m/%Y a las %H:%M')}" for c in sorted(clases_data["gratis"])])
-    if clases_data["premium"]: msg += "\n**Premium:**\n" + "\n".join([f"  - {datetime.fromisoformat(c).strftime('%d/%m/%Y a las %H:%M')}" for c in sorted(clases_data["premium"])])
+    clases_gratis = [r for r in clases_records if r['tipo'] == 'gratis']
+    clases_premium = [r for r in clases_records if r['tipo'] == 'premium']
+
+    if clases_gratis:
+        msg += "\n**Gratuitas:**\n" + "\n".join([f"  - {r['fecha_hora'].strftime('%d/%m/%Y a las %H:%M')} UTC" for r in clases_gratis])
+    if clases_premium:
+        msg += "\n**Premium:**\n" + "\n".join([f"  - {r['fecha_hora'].strftime('%d/%m/%Y a las %H:%M')} UTC" for r in clases_premium])
     await ctx.send(msg)
 
-# --- COMANDOS DE AYUDA ---
+# --- COMANDOS DE AYUDA (sin cambios) ---
 @bot.command(name="help")
 async def help_command(ctx):
     embed = discord.Embed(title="🤖 Comandos de la Academia", description="Aquí tienes los comandos que puedes usar:", color=discord.Color.blue())
@@ -217,6 +336,7 @@ async def adminhelp_command(ctx):
     await ctx.send(embed=embed)
 
 # --- COMANDOS DE ADMINISTRACIÓN ---
+# setup (sin cambios)
 @bot.command(name="setup")
 @commands.has_permissions(administrator=True)
 async def setup(ctx):
@@ -234,77 +354,97 @@ async def setup(ctx):
 @bot.command(name="clase_gratis")
 @commands.has_permissions(administrator=True)
 async def clase_gratis(ctx, fecha: str, hora: str):
-    try: dt = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M")
-    except ValueError: return await ctx.send("❌ Formato inválido. Usa: `AAAA-MM-DD HH:MM`")
-    clases_data["gratis"].append(dt.isoformat())
-    await ctx.send(f"✅ Clase gratuita programada para el **{dt.strftime('%d/%m/%Y a las %H:%M')}**.")
+    try:
+        dt = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return await ctx.send("❌ Formato inválido. Usa: `AAAA-MM-DD HH:MM` (en UTC)")
+    
+    async with db_pool.acquire() as conn: # <--- CAMBIO
+        await conn.execute("INSERT INTO clases (tipo, fecha_hora) VALUES ('gratis', $1)", dt)
+        
+    await ctx.send(f"✅ Clase gratuita programada para el **{dt.strftime('%d/%m/%Y a las %H:%M')} UTC**.")
 
 @bot.command(name="clase_premium")
 @commands.has_permissions(administrator=True)
 async def clase_premium(ctx, fecha: str, hora: str):
-    try: dt = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M")
-    except ValueError: return await ctx.send("❌ Formato inválido. Usa: `AAAA-MM-DD HH:MM`")
-    clases_data["premium"].append(dt.isoformat())
-    await ctx.send(f"✅ Clase premium programada para el **{dt.strftime('%d/%m/%Y a las %H:%M')}**.")
+    try:
+        dt = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return await ctx.send("❌ Formato inválido. Usa: `AAAA-MM-DD HH:MM` (en UTC)")
+        
+    async with db_pool.acquire() as conn: # <--- CAMBIO
+        await conn.execute("INSERT INTO clases (tipo, fecha_hora) VALUES ('premium', $1)", dt)
+        
+    await ctx.send(f"✅ Clase premium programada para el **{dt.strftime('%d/%m/%Y a las %H:%M')} UTC**.")
 
 @bot.command(name="test_xp")
 @commands.has_permissions(administrator=True)
 async def test_xp(ctx, member: discord.Member, cantidad: int):
-    user_id = str(member.id)
-    if user_id not in xp_data: xp_data[user_id] = {"xp": 0, "level": 1, "weekly_xp": 0}
-    xp_data[user_id]["xp"] += cantidad
-    xp_data[user_id]["weekly_xp"] = xp_data[user_id].get("weekly_xp", 0) + cantidad
-    await ctx.send(f"✅ Añadidos `{cantidad}` XP a {member.mention}. XP total: `{xp_data[user_id]['xp']}`.")
-    old_level = xp_data[user_id].get("level", 1); new_level = get_level(xp_data[user_id]['xp'])
+    user_data = await get_user_data(member.id) # <--- CAMBIO
+    old_level = user_data['level'] if user_data else 1
+    
+    updated_data = await upsert_user_xp(member.id, cantidad, cantidad) # <--- CAMBIO
+    
+    await ctx.send(f"✅ Añadidos `{cantidad}` XP a {member.mention}. XP total: `{updated_data['xp']}`.")
+    
+    new_level = get_level(updated_data['xp'])
     if new_level > old_level:
-        xp_data[user_id]["level"] = new_level
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE users SET level = $1 WHERE user_id = $2", new_level, member.id)
         await assign_level_role(member, new_level)
         await ctx.send(f"¡{member.mention} ha subido al **Nivel {new_level}**!")
 
 # --- TAREAS AUTOMÁTICAS (LOOPS) ---
-@tasks.loop(seconds=60)
-async def save_data_loop():
-    save_data(XP_FILE, xp_data)
-    save_data(CLASES_FILE, clases_data)
+
+# @tasks.loop(seconds=60) # <--- CAMBIO: Eliminamos este loop por completo
+# async def save_data_loop():
+#     pass
 
 @tasks.loop(hours=24)
 async def check_inactivity():
     await bot.wait_until_ready()
-    seven_days_ago_ts = (datetime.now(timezone.utc) - timedelta(days=7)).timestamp()
-    for user_id, data in list(xp_data.items()):
-        if data.get("last_message_timestamp", 0) < seven_days_ago_ts:
-            user = bot.get_user(int(user_id))
+    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    
+    async with db_pool.acquire() as conn: # <--- CAMBIO
+        inactive_users = await conn.fetch("SELECT user_id FROM users WHERE last_message_timestamp < $1", seven_days_ago)
+        
+        for record in inactive_users:
+            user = bot.get_user(record['user_id'])
             if user:
                 try:
                     await user.send("💪 ¡Hey! Notamos que llevas unos días sin pasar por la Academia de Calistenia 🏋️‍♂️.\n¡Vuelve a entrenar con nosotros y comparte tu progreso!")
-                    xp_data[user_id]["last_message_timestamp"] = datetime.now(timezone.utc).timestamp()
-                except discord.Forbidden: print(f"No se pudo enviar DM al usuario inactivo {user.name}")
+                    # Actualizamos su timestamp para no volver a molestarle pronto
+                    await conn.execute("UPDATE users SET last_message_timestamp = $1 WHERE user_id = $2", datetime.now(timezone.utc), user.id)
+                except discord.Forbidden:
+                    print(f"No se pudo enviar DM al usuario inactivo {user.name}")
 
 @tasks.loop(hours=1)
 async def revisar_clases():
     await bot.wait_until_ready()
     now = datetime.now(timezone.utc)
-    for tipo, lista_iso in clases_data.items():
-        # Asumiendo que el bot está en un solo servidor
-        guild = bot.guilds[0] if bot.guilds else None
-        if not guild: continue
+    
+    async with db_pool.acquire() as conn:
+        # Primero, borramos las clases que ya pasaron
+        await conn.execute("DELETE FROM clases WHERE fecha_hora < $1", now)
         
-        canal_nombre = "clases-grupales" if tipo == "gratis" else "clases-exclusivas"
+        # Luego, buscamos las clases que necesiten recordatorio
+        clases_a_recordar = await conn.fetch("SELECT id, tipo, fecha_hora FROM clases")
+        
+    guild = bot.guilds[0] if bot.guilds else None
+    if not guild: return
+    
+    for clase in clases_a_recordar:
+        canal_nombre = "clases-grupales" if clase['tipo'] == "gratis" else "clases-exclusivas"
         canal = discord.utils.get(guild.text_channels, name=canal_nombre)
         if not canal: continue
+        
+        time_until = clase['fecha_hora'] - now
+        # Lógica de recordatorio (sin cambios)
+        if timedelta(hours=47) < time_until <= timedelta(hours=48) or timedelta(hours=23) < time_until <= timedelta(hours=24):
+            day_str = "2 días" if time_until > timedelta(hours=24) else "MAÑANA"
+            await canal.send(f"@everyone 🚨 ¡Recordatorio! La clase de **{clase['tipo']}** es en {day_str} ({clase['fecha_hora'].strftime('%d/%m a las %H:%M')} UTC)")
 
-        for c_iso in list(lista_iso):
-            clase_dt = datetime.fromisoformat(c_iso).replace(tzinfo=timezone.utc)
-            if clase_dt < now: 
-                clases_data[tipo].remove(c_iso)
-                continue
-            
-            time_until = clase_dt - now
-            if timedelta(hours=47) < time_until <= timedelta(hours=48) or timedelta(hours=23) < time_until <= timedelta(hours=24):
-                 days_left = 2 if time_until > timedelta(hours=24) else 1
-                 day_str = "2 días" if days_left == 2 else "MAÑANA"
-                 await canal.send(f"@everyone 🚨 ¡Recordatorio! La clase de **{tipo}** es en {day_str} ({clase_dt.strftime('%d/%m a las %H:%M')})")
-
+# recordatorio_asesorias (sin cambios)
 @tasks.loop(hours=48)
 async def recordatorio_asesorias():
     await bot.wait_until_ready()
@@ -323,17 +463,19 @@ async def ranking_semanal():
     ranking_channel = discord.utils.get(guild.text_channels, name="ranking")
     if not ranking_channel: return
     
-    sorted_users = sorted([item for item in xp_data.items() if item[1].get("weekly_xp", 0) > 0], key=lambda item: item[1]["weekly_xp"], reverse=True)
+    async with db_pool.acquire() as conn: # <--- CAMBIO
+        sorted_users = await conn.fetch("SELECT user_id, weekly_xp FROM users WHERE weekly_xp > 0 ORDER BY weekly_xp DESC LIMIT 10")
+    
     if not sorted_users: return
     
     embed = discord.Embed(title="🏆 Ranking Semanal de la Academia 🏆", description="¡Estos son los miembros más activos de la semana!\n\n", color=discord.Color.gold())
-    for i, (user_id, data) in enumerate(sorted_users[:10]):
-        user = guild.get_member(int(user_id))
-        embed.description += f"**{i+1}.** {user.mention if user else f'Usuario Desconocido'} - `{data['weekly_xp']}` XP\n"
+    for i, user_data in enumerate(sorted_users):
+        user = guild.get_member(user_data['user_id'])
+        embed.description += f"**{i+1}.** {user.mention if user else 'Usuario Desconocido'} - `{user_data['weekly_xp']}` XP\n"
     
     await ranking_channel.send(embed=embed)
-
-    campeon_id = int(sorted_users[0][0])
+    
+    campeon_id = sorted_users[0]['user_id']
     campeon_member = guild.get_member(campeon_id)
     if campeon_member:
         max_n = sum(1 for role in guild.roles if role.name.startswith("🏆 Campeón de la Semana #"))
@@ -341,29 +483,31 @@ async def ranking_semanal():
         campeon_role = await guild.create_role(name=role_name, color=discord.Color.gold(), mentionable=True)
         await campeon_member.add_roles(campeon_role)
         await ranking_channel.send(f"¡Felicidades {campeon_member.mention}, eres el **{role_name}**!")
-
+    
     if guild.member_count > 15:
         for user_id, data in sorted_users[:10]:
             member = guild.get_member(int(user_id))
             if member:
                 try: await member.send(f"🚀 ¡Felicidades! Estás en el TOP 10 de la Academia con `{data['weekly_xp']}` XP esta semana.")
                 except discord.Forbidden: pass
-    
-    for user_id in xp_data: xp_data[user_id]["weekly_xp"] = 0
+
+    async with db_pool.acquire() as conn: # <--- CAMBIO: Reseteamos el XP semanal de todos con un solo comando, ¡mucho más eficiente!
+        await conn.execute("UPDATE users SET weekly_xp = 0")
+    print("XP semanal reseteado para todos los usuarios.")
 
 # --- EJECUCIÓN DEL BOT ---
 if __name__ == "__main__":
-    DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
     if OPENAI_API_KEY:
         openai_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
     else:
         print("⚠️ AVISO: No se proporcionó clave API de OpenAI. El comando !calistenico no funcionará.")
-
-    try:
-        bot.run(DISCORD_BOT_TOKEN)
-    except discord.errors.LoginFailure:
-        print("❌ ERROR: El token de Discord es inválido.")
-    except Exception as e:
-        print(f"❌ ERROR INESPERADO: {e}")
+    
+    if not DISCORD_BOT_TOKEN or not DATABASE_URL: # <--- CAMBIO
+        print("❌ ERROR: Falta el token de Discord o la URI de la base de datos.")
+    else:
+        try:
+            bot.run(DISCORD_BOT_TOKEN)
+        except discord.errors.LoginFailure:
+            print("❌ ERROR: El token de Discord es inválido.")
+        except Exception as e:
+            print(f"❌ ERROR INESPERADO: {e}")
