@@ -6,6 +6,9 @@ load_dotenv()
 # Discord
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
+# Admin Role
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID"))
+
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 

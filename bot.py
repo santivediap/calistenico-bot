@@ -5,7 +5,7 @@ import os
 import openai
 from datetime import datetime, timedelta, timezone
 import config
-from config import DISCORD_BOT_TOKEN, OPENAI_API_KEY, DATABASE_URL # <--- CAMBIO
+from config import DISCORD_BOT_TOKEN, OPENAI_API_KEY, DATABASE_URL, ADMIN_ROLE_ID # <--- CAMBIO
 import asyncpg # <--- CAMBIO
 from keep_alive import keep_alive
 
@@ -326,7 +326,7 @@ async def help_command(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name="adminhelp")
-@commands.has_role(1414358400707592382)
+@commands.has_role(ADMIN_ROLE_ID)
 async def adminhelp_command(ctx):
     embed = discord.Embed(title="👑 Comandos de Administración", description="Comandos para gestionar el servidor:", color=discord.Color.gold())
     embed.add_field(name="`!setup`", value="Crea/repara la estructura de canales del servidor.", inline=False)
@@ -338,7 +338,7 @@ async def adminhelp_command(ctx):
 # --- COMANDOS DE ADMINISTRACIÓN ---
 # setup (sin cambios)
 @bot.command(name="setup")
-@commands.has_permissions(administrator=True)
+@commands.has_role(ADMIN_ROLE_ID)
 async def setup(ctx):
     await ctx.send("Configurando y verificando canales del servidor...")
     canales = { "📜 INFORMACIÓN": ["bienvenida", "reglas", "anuncios", "level-up", "ranking"], "🏋️ ENTRENAMIENTO": ["rutina-semanal", "videos-explicativos", "progresos"], "💬 COMUNIDAD": ["charla-general", "presentaciones", "💬-banquito"], "💎 PREMIUM": ["clases-grupales", "asesorias-personales", "clases-exclusivas"], "🎤 ZONAS DE VOZ": ["🎤-parque-de-barras"]}
@@ -352,7 +352,7 @@ async def setup(ctx):
     await ctx.send("✅ ¡Servidor configurado!")
 
 @bot.command(name="clase_gratis")
-@commands.has_permissions(administrator=True)
+@commands.has_role(ADMIN_ROLE_ID)
 async def clase_gratis(ctx, fecha: str, hora: str):
     try:
         dt = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
@@ -365,7 +365,7 @@ async def clase_gratis(ctx, fecha: str, hora: str):
     await ctx.send(f"✅ Clase gratuita programada para el **{dt.strftime('%d/%m/%Y a las %H:%M')} UTC**.")
 
 @bot.command(name="clase_premium")
-@commands.has_permissions(administrator=True)
+@commands.has_role(ADMIN_ROLE_ID)
 async def clase_premium(ctx, fecha: str, hora: str):
     try:
         dt = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
@@ -378,7 +378,7 @@ async def clase_premium(ctx, fecha: str, hora: str):
     await ctx.send(f"✅ Clase premium programada para el **{dt.strftime('%d/%m/%Y a las %H:%M')} UTC**.")
 
 @bot.command(name="test_xp")
-@commands.has_permissions(administrator=True)
+@commands.has_role(ADMIN_ROLE_ID)
 async def test_xp(ctx, member: discord.Member, cantidad: int):
     user_data = await get_user_data(member.id) # <--- CAMBIO
     old_level = user_data['level'] if user_data else 1
