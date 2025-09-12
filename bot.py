@@ -3,18 +3,64 @@ from discord.ext import commands, tasks
 import json
 import os
 import openai
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 import config
 from config import DISCORD_BOT_TOKEN, OPENAI_API_KEY, DATABASE_URL, ADMIN_ROLE_ID # <--- CAMBIO
 import asyncpg # <--- CAMBIO
 from keep_alive import keep_alive
 
+import random
+import gspread
+from google.oauth2.service_account import Credentials
+
 keep_alive()
+
+def load_data(file_path, default_data={}):
+    """
+    Carga datos desde un archivo JSON.
+    Si el archivo no existe, está vacío o corrupto, devuelve los datos por defecto.
+    """
+    # Primero, revisa si el archivo existe en la carpeta.
+    if os.path.exists(file_path):
+        # Si existe, lo abre en modo lectura ('r') con codificación UTF-8 (importante para emojis y acentos).
+        with open(file_path, 'r', encoding='utf-8') as f:
+            try:
+                # Intenta leer el contenido y convertirlo de JSON a un diccionario de Python.
+                return json.load(f)
+            except json.JSONDecodeError:
+                # Si el archivo está vacío o mal formateado, no dará error,
+                # sino que devolverá los datos por defecto para evitar que el bot se caiga.
+                return default_data
+    else:
+        # Si el archivo no existe, simplemente devuelve los datos por defecto.
+        return default_data
+
+def save_data(file_path, data):
+    """
+    Guarda los datos (un diccionario de Python) en un archivo JSON.
+    Sobrescribe el archivo si ya existe.
+    """
+    # Abre el archivo en modo escritura ('w'), lo que significa que creará el archivo si no existe
+    # o borrará su contenido si ya existe para escribir los nuevos datos.
+    with open(file_path, 'w', encoding='utf-8') as f:
+        # Convierte el diccionario de Python a formato JSON y lo escribe en el archivo.
+        # indent=4 es para que el archivo se guarde de forma bonita y ordenada,
+        # fácil de leer para un humano.
+        json.dump(data, f, indent=4)
 
 # --- CONFIGURACIÓN DEL BOT ---
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
+
+GOOGLE_SHEET_NAME = "Rutinas Academia Bot"  # Asegúrate de que este nombre sea exacto.
+ROUTINE_CHANNEL_NAME = "rutina-semanal"
+USED_ROUTINES_FILE = "used_routines.json" # ????
+# Define la hora de publicación. Ejemplo: 8:00 AM en horario de España (CET/CEST es UTC+2)
+TIME_TO_POST = time(hour=8, minute=0, tzinfo=timezone(timedelta(hours=2))) 
+# Inicializa el cliente de Google Sheets
+gsheet_client = None
+
 bot = commands.Bot(command_prefix="!", intents=INTENTS, help_command=None)
 
 # --- VARIABLES GLOBALES Y CONEXIÓN A DB --- # <--- CAMBIO
@@ -40,77 +86,13 @@ async def get_user_data(user_id): # <--- CAMBIO: Nueva función para obtener dat
 async def upsert_user_xp(user_id, xp_gain, is_rutina=False, is_attachment=False):
     today = datetime.now(timezone.utc).date()
     now_ts = datetime.now(timezone.utc)
-
-    # --- Lógica de la inserción para un usuario nuevo ---
-    # Define los valores iniciales que tendría un usuario si se crea en esta acción
-    initial_values = {
-        'user_id': user_id,
-        'xp': xp_gain,
-        'weekly_xp': xp_gain,
-        'last_message_timestamp': now_ts,
-        'last_rutina_date': today if is_rutina else None,
-        'last_attachment_date': today if is_attachment else None,
-        'attachments_today': 1 if is_attachment else 0
-    }
     
-    # --- Lógica de la actualización para un usuario existente ---
-    update_clauses = [
-        "xp = users.xp + $2",
-        "weekly_xp = users.weekly_xp + $2",
-    ]
-    # Empezamos con los parámetros que siempre están: user_id ($1) y xp_gain ($2)
-    params = [user_id, xp_gain]
-    param_idx = 3  # El siguiente parámetro a usar será $3
-
-    if is_rutina:
-        update_clauses.append(f"last_rutina_date = ${param_idx}")
-        params.append(today)
-        param_idx += 1
-    
-    if is_attachment:
-        update_clauses.append(f"last_attachment_date = ${param_idx}")
-        params.append(today)
-        param_idx += 1
-        # Importante: El contador de attachments se resetea en on_message, aquí solo lo incrementamos.
-        update_clauses.append("attachments_today = users.attachments_today + 1")
-
-    # El timestamp del último mensaje siempre se actualiza
-    update_clauses.append(f"last_message_timestamp = ${param_idx}")
-    params.append(now_ts)
-
-    # --- Construcción de la consulta final ---
-    # Preparamos las columnas y los placeholders para la parte INSERT
-    insert_cols = ", ".join(initial_values.keys())
-    insert_placeholders = ", ".join(f"${i+1}" for i in range(len(initial_values)))
-    
-    # Preparamos la lista de valores para el INSERT
-    insert_params = list(initial_values.values())
-
-    # Preparamos la parte UPDATE
-    update_string = ",\n            ".join(update_clauses)
-    
-    query = f"""
-        INSERT INTO users ({insert_cols})
-        VALUES ({insert_placeholders})
-        ON CONFLICT (user_id) DO UPDATE
-        SET
-            {update_string}
-        RETURNING xp, level;
-    """
-    
-    # Los parámetros para el INSERT y el UPDATE son diferentes.
-    # Necesitamos una forma de ejecutar la lógica correcta.
-    # La forma más fácil es leer primero y luego decidir si insertar o actualizar.
-
-    # --- CORRECCIÓN MÁS SIMPLE Y DIRECTA ---
-    # El método anterior es muy robusto pero complejo.
-    # Volvamos a una versión más simple que solo corrige el error original.
-    
+    # Primero, intentamos obtener los datos del usuario.
     user_data = await get_user_data(user_id)
     
     if not user_data:
-        # Es un usuario nuevo, hacemos un INSERT simple
-        query_insert = f"""
+        # Si no hay datos, es un usuario nuevo. Hacemos un INSERT.
+        query_insert = """
             INSERT INTO users (user_id, xp, weekly_xp, last_message_timestamp, last_rutina_date, last_attachment_date, attachments_today)
             VALUES ($1, $2, $2, $3, $4, $5, $6)
             RETURNING xp, level;
@@ -123,7 +105,7 @@ async def upsert_user_xp(user_id, xp_gain, is_rutina=False, is_attachment=False)
                 1 if is_attachment else 0
             )
     else:
-        # Es un usuario existente, construimos el UPDATE dinámicamente
+        # Si hay datos, es un usuario existente. Hacemos un UPDATE.
         update_clauses = [
             "xp = users.xp + $2",
             "weekly_xp = users.weekly_xp + $2",
@@ -187,28 +169,144 @@ async def assign_level_role(member, new_level):
 # --- EVENTOS PRINCIPALES ---
 @bot.event
 async def on_ready():
-    global db_pool, openai_client # <--- CAMBIO
+    global db_pool, openai_client  # <--- CAMBIO
+    global gsheet_client
     try: # <--- CAMBIO: Conectamos a la base de datos
         db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10)
         print("✅ Conectado a la base de datos PostgreSQL.")
     except Exception as e:
         print(f"❌ Error al conectar a la base de datos: {e}")
         return
-
-    # Eliminamos la carga de datos de JSONs
-    # xp_data = load_data(...)
-    # clases_data = load_data(...)
     
-    # Eliminamos el loop de guardado, ya no es necesario
-    # save_data_loop.start()
+    try:
+        # 1. Construimos el diccionario de credenciales leyendo las variables de entorno.
+        gcp_credentials_dict = {
+            "type": "service_account",
+            "project_id": config.GCP_PROJECT_ID,
+            "private_key_id": config.GCP_PRIVATE_KEY_ID,
+            # Este .replace() es clave para que los saltos de línea de la private_key funcionen bien.
+            "private_key": config.GCP_PRIVATE_KEY.replace('\n', '\n'),
+            "client_email": config.GCP_CLIENT_EMAIL,
+            "client_id": config.GCP_CLIENT_ID,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": config.GCP_CLIENT_X509_CERT_URL
+        }
+
+        # 2. Verificamos que las variables esenciales no estén vacías.
+        if not all([config.GCP_PROJECT_ID, config.GCP_PRIVATE_KEY, config.GCP_CLIENT_EMAIL]):
+            print("⚠️ AVISO: Faltan variables de entorno de GCP. La función de rutinas diarias no funcionará.")
+            gsheet_client = None
+        else:
+            # 3. Autorizamos usando la información del diccionario, no un archivo.
+            scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+            creds = Credentials.from_service_account_info(gcp_credentials_dict, scopes=scopes)
+            gsheet_client = gspread.authorize(creds)
+            print("✅ Conexión con Google Sheets establecida desde variables de entorno.")
+
+    except Exception as e:
+        print(f"❌ ERROR al conectar con Google Sheets desde variables de entorno: {e}")
+        gsheet_client = None
+    # --- FIN DEL BLOQUE DE CONEXIÓN ---
     
     check_inactivity.start()
     ranking_semanal.start()
     recordatorio_asesorias.start()
     revisar_clases.start()
+    post_daily_routine.start() # <-- AÑADE ESTA LÍNEA para iniciar la nueva tarea
     
     print(f"✅ Bot conectado como {bot.user}")
     print(f"   - Servidores: {[guild.name for guild in bot.guilds]}")
+
+# --- PEGA ESTA NUEVA TAREA PROGRAMADA JUNTO A LAS OTRAS TAREAS ---
+@tasks.loop(time=TIME_TO_POST)
+async def post_daily_routine():
+    await bot.wait_until_ready()
+
+    # # Comprobación del día de la semana
+    # hoy = datetime.now(timezone.utc)
+    # # En Python, Lunes es 0, Martes es 1, ..., Sábado es 5 y Domingo es 6.
+    # if hoy.weekday() in [5, 6]: # Si es Sábado o Domingo
+    #     print("Hoy es fin de semana, no se publica rutina.")
+    #     return # La función se detiene y no hace nada más.
+
+    # Asume que el bot está en un solo servidor
+    guild = bot.guilds[0] if bot.guilds else None
+    if not guild or not gsheet_client:
+        print("Bot no está en un servidor o no hay conexión con Google Sheets. Saltando rutina.")
+        return
+
+    routine_channel = discord.utils.get(guild.text_channels, name=ROUTINE_CHANNEL_NAME)
+    if not routine_channel:
+        print(f"!!! AVISO: No se encontró el canal #{ROUTINE_CHANNEL_NAME}.")
+        return
+
+    try:
+        spreadsheet = gsheet_client.open(GOOGLE_SHEET_NAME)
+        worksheet = spreadsheet.sheet1
+        all_routines = worksheet.get_all_records()
+    except Exception as e:
+        print(f"❌ ERROR al leer el Google Sheet: {e}")
+        return
+
+    if not all_routines:
+        return
+
+    # Lógica para no repetir rutinas en la misma semana
+    used_data = load_data(USED_ROUTINES_FILE, {"last_reset_week": -1, "used_indices": []})
+    current_week = datetime.now(timezone.utc).isocalendar()[1]
+    if used_data["last_reset_week"] != current_week:
+        used_data["last_reset_week"] = current_week
+        used_data["used_indices"] = []
+
+    available_routines = [(i, r) for i, r in enumerate(all_routines) if i not in used_data["used_indices"]]
+    if not available_routines:
+        used_data["used_indices"] = []
+        available_routines = list(enumerate(all_routines))
+        await routine_channel.send("¡Hemos completado todas las rutinas de la semana! Empezamos de nuevo el ciclo. 🔥")
+
+    chosen_index, chosen_routine = random.choice(available_routines)
+    used_data["used_indices"].append(chosen_index)
+    save_data(USED_ROUTINES_FILE, used_data)
+
+    # --- Bloque de mejora de la presentación con IA ---
+    raw_title = chosen_routine.get('titulo_rutina', 'Rutina del Día')
+    raw_description = chosen_routine.get('descripcion_rutina', 'No hay descripción.')
+    enhanced_description = raw_description
+
+    if openai_client:
+        try:
+            enhancer_prompt = f"""
+            Toma la siguiente rutina y mejórala para un anuncio de Discord.
+            Reglas: NO cambies los ejercicios, series o repeticiones. SÓLO mejora la presentación. Usa emojis (💪,🔥), formato de Discord como **negritas** y añade una intro y cierre motivadores.
+            
+            Título: {raw_title}
+            Descripción: {raw_description}
+            """
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Eres un entrenador de fitness que formatea rutinas para anuncios de Discord de forma visual y motivadora."},
+                    {"role": "user", "content": enhancer_prompt}
+                ],
+                max_tokens=1024,
+                temperature=0.7
+            )
+            enhanced_description = response.choices[0].message.content
+        except Exception as e:
+            print(f"!!! ERROR al mejorar la rutina con IA: {e}. Publicando sin formato.")
+    
+    # Publicar la rutina mejorada en Discord
+    embed = discord.Embed(
+        title=f"🗓️ {raw_title}",
+        description=enhanced_description,
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text="¡A entrenar! No olvides escribir 'RUTINA HECHA' al terminar.")
+    await routine_channel.send(f"¡Buenos días, equipo! @everyone aquí tenéis el entrenamiento de hoy:", embed=embed)
+
 
 # on_member_join (sin cambios)
 @bot.event
@@ -284,6 +382,13 @@ async def nivel(ctx):
         await ctx.send(f"📊 {ctx.author.mention}, eres **Nivel {user_data['level']}** con **{user_data['xp']}** XP.")
     else:
         await ctx.send("Aún no tienes XP. ¡Empieza a participar!")
+
+# --- PEGA ESTE NUEVO COMANDO DE TEST JUNTO A LOS OTROS COMANDOS DE ADMIN ---
+@bot.command(name="test_rutina")
+@commands.has_role(ADMIN_ROLE_ID)
+async def test_rutina(ctx):
+    await ctx.send("⚙️ Forzando la publicación de una rutina de prueba...")
+    await post_daily_routine()
 
 # calistenico (sin cambios)
 @bot.command(name="calistenico")

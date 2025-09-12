@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from datetime import time, timezone, timedelta
 
 load_dotenv()
 
@@ -14,6 +15,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Base de datos (Neon Postgres)
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Google Sheets Vars
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+GCP_PRIVATE_KEY_ID = os.getenv("GCP_PRIVATE_KEY_ID")
+GCP_PRIVATE_KEY = os.getenv("GCP_PRIVATE_KEY")
+GCP_CLIENT_EMAIL = os.getenv("GCP_CLIENT_EMAIL")
+GCP_CLIENT_ID = os.getenv("GCP_CLIENT_ID")
+GCP_CLIENT_X509_CERT_URL = os.getenv("GCP_CLIENT_X509_CERT_URL")
 
 # XP y roles
 XP_PER_MESSAGE = 5
