@@ -225,11 +225,11 @@ async def post_daily_routine():
     await bot.wait_until_ready()
 
     # # Comprobación del día de la semana
-    # hoy = datetime.now(timezone.utc)
-    # # En Python, Lunes es 0, Martes es 1, ..., Sábado es 5 y Domingo es 6.
-    # if hoy.weekday() in [5, 6]: # Si es Sábado o Domingo
-    #     print("Hoy es fin de semana, no se publica rutina.")
-    #     return # La función se detiene y no hace nada más.
+    hoy = datetime.now(timezone.utc)
+    # En Python, Lunes es 0, Martes es 1, ..., Sábado es 5 y Domingo es 6.
+    if hoy.weekday() in [5, 6]: # Si es Sábado o Domingo
+        print("Hoy es fin de semana, no se publica rutina.")
+        return # La función se detiene y no hace nada más.
 
     # Asume que el bot está en un solo servidor
     guild = bot.guilds[0] if bot.guilds else None
